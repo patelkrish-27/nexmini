@@ -147,8 +147,24 @@ def _patch_notebook_secrets(workdir: Path) -> None:
                 cell["source"] = src.splitlines(keepends=True)
                 changed = True
         if changed:
+            # keep the VM alive so the ngrok tunnel keeps running; otherwise
+            # Kaggle ends the session right after the last cell (status COMPLETE)
+            nb["cells"].append(
+                {
+                    "cell_type": "code",
+                    "execution_count": None,
+                    "metadata": {},
+                    "outputs": [],
+                    "source": [
+                        "import time\n",
+                        "print('Keeping the session alive so the ngrok tunnel stays up ...')\n",
+                        "while True:\n",
+                        "    time.sleep(300)\n",
+                    ],
+                }
+            )
             nb_path.write_text(json.dumps(nb, indent=1))
-            LOG.info("patched ngrok secrets into %s", nb_path.name)
+            LOG.info("patched ngrok secrets + keepalive into %s", nb_path.name)
 
 
 def start_kernel(account: int) -> dict[str, Any]:
