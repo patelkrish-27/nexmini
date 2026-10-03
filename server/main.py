@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -226,6 +227,36 @@ def _make_job(weekday: int, hour: int, account: int):
     return job
 
 
+def configured(account: int) -> bool:
+    return bool(os.environ.get(f"KAGGLE_API_TOKEN_{account}") and os.environ.get(f"KAGGLE_KERNEL_{account}"))
+
+
+def watchdog() -> None:
+    """If the account due right now is not running, start its notebook."""
+    if os.environ.get("AUTO_START", "true").lower() not in ("1", "true", "yes"):
+        return
+    try:
+        account = current_account()
+        if account is None or not configured(account):
+            return
+        state = _load_state()
+        last = state["runs"].get(f"account{account}", {}).get("started")
+        if last:
+            age_s = (datetime.now(IST) - datetime.fromisoformat(last)).total_seconds()
+            if age_s < 600:  # give a push at least 10 min to reach RUNNING
+                return
+        status = kernel_status(account)
+        if status not in ("RUNNING", "QUEUED"):
+            LOG.warning("watchdog: account %s is %s; restarting notebook", account, status)
+            now = datetime.now(IST)
+            bw, bh = now.weekday(), (8 if 8 <= now.hour < 20 else 20)
+            if now.hour < 8:
+                bw, bh = (bw - 1) % 7, 20
+            run_account(account, handoff_from=previous_block_account(bw, bh))
+    except Exception:
+        LOG.exception("watchdog error")
+
+
 def start_scheduler() -> None:
     for weekday, hour, account in BLOCKS:
         token = os.environ.get(f"KAGGLE_API_TOKEN_{account}")
@@ -242,8 +273,11 @@ def start_scheduler() -> None:
             id=f"account{account}_{_DOW[weekday]}_{hour:02d}",
             replace_existing=True,
         )
+    scheduler.add_job(
+        watchdog, IntervalTrigger(minutes=5), id="watchdog", replace_existing=True,
+    )
     scheduler.start()
-    LOG.info("scheduler started with %d block jobs", len(scheduler.get_jobs()))
+    LOG.info("scheduler started with %d block jobs + watchdog", len(scheduler.get_jobs()))
 
 
 # ------------------------------------------------------------------ app ----
