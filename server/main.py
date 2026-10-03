@@ -146,9 +146,10 @@ def _patch_notebook_secrets(workdir: Path) -> None:
                 )
                 cell["source"] = src.splitlines(keepends=True)
                 changed = True
-        if changed:
-            # keep the VM alive so the ngrok tunnel keeps running; otherwise
-            # Kaggle ends the session right after the last cell (status COMPLETE)
+        if token not in json.dumps(nb):
+            LOG.warning("could not inject NGROK_AUTHTOKEN into notebook")
+        # never trust a previously pushed version: append keepalive unless present
+        if "Keeping the session alive" not in json.dumps(nb):
             nb["cells"].append(
                 {
                     "cell_type": "code",
@@ -163,6 +164,10 @@ def _patch_notebook_secrets(workdir: Path) -> None:
                     ],
                 }
             )
+            changed = True
+        if changed:
+            # keep the VM alive so the ngrok tunnel keeps running; otherwise
+            # Kaggle ends the session right after the last cell (status COMPLETE)
             nb_path.write_text(json.dumps(nb, indent=1))
             LOG.info("patched ngrok secrets + keepalive into %s", nb_path.name)
 
