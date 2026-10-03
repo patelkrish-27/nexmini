@@ -283,7 +283,13 @@ def _make_job(weekday: int, hour: int, account: int):
 
 
 def configured(account: int) -> bool:
-    return bool(os.environ.get(f"KAGGLE_API_TOKEN_{account}") and os.environ.get(f"KAGGLE_KERNEL_{account}"))
+    token = os.environ.get(f"KAGGLE_API_TOKEN_{account}", "")
+    kernel = os.environ.get(f"KAGGLE_KERNEL_{account}", "")
+    if not token or not kernel:
+        return False
+    if token.startswith("FAKE_TOKEN") or kernel.startswith("REPLACE_ME"):
+        return False
+    return True
 
 
 def watchdog() -> None:
@@ -314,9 +320,7 @@ def watchdog() -> None:
 
 def start_scheduler() -> None:
     for weekday, hour, account in BLOCKS:
-        token = os.environ.get(f"KAGGLE_API_TOKEN_{account}")
-        kernel = os.environ.get(f"KAGGLE_KERNEL_{account}")
-        if not token or not kernel:
+        if not configured(account):
             LOG.warning(
                 "skipping %s %02d:00 block: account %s missing token/kernel env",
                 _DOW[weekday], hour, account,
@@ -384,7 +388,7 @@ async def status() -> dict[str, Any]:
     state = _load_state()
     kernels: dict[str, str] = {}
     for i in range(1, 7):
-        if os.environ.get(f"KAGGLE_API_TOKEN_{i}") and os.environ.get(f"KAGGLE_KERNEL_{i}"):
+        if configured(i):
             kernels[f"account{i}"] = kernel_status(i)
         else:
             kernels[f"account{i}"] = "not configured"
