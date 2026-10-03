@@ -94,10 +94,11 @@ def kernel_status(account: int) -> str:
     try:
         p = _run(["kaggle", "kernels", "status", _kernel(account)], _kaggle_env(account), timeout=60)
         out = (p.stdout + p.stderr).strip()
-        # e.g. "Kernel 'user/kernel' has status 'RUNNING'"
-        if "'" in out:
-            return out.rsplit("'", 2)[0].rsplit("'", 1)[-1].strip().upper() or out
-        return out or "UNKNOWN"
+        upper = out.upper()
+        for kw in ("RUNNING", "QUEUED", "COMPLETE", "FAILED", "ERROR", "CANCELLED", "STOPPED"):
+            if kw in upper:
+                return kw
+        return out[:120] or "UNKNOWN"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -106,7 +107,7 @@ def wait_for_kernel_idle(account: int, timeout_s: int = 1800, poll_s: int = 30) 
     """Block until the kernel is no longer RUNNING/QUEUED (used at handoff)."""
     deadline = time.monotonic() + timeout_s
     status = kernel_status(account)
-    while status.startswith(("RUNNING", "QUEUED", "KERNEL_STATUS")) and time.monotonic() < deadline:
+    while status in ("RUNNING", "QUEUED") and time.monotonic() < deadline:
         LOG.info("account %s kernel is %s; waiting before handoff...", account, status)
         time.sleep(poll_s)
         status = kernel_status(account)
@@ -212,7 +213,7 @@ def _startup() -> None:
         if account is not None:
             status = kernel_status(account)
             LOG.info("startup: inside account %s window, kernel status=%s", account, status)
-            if not status.startswith(("RUNNING", "QUEUED")):
+            if status not in ("RUNNING", "QUEUED"):
                 other = 2 if account == 1 else 1
                 threading.Thread(
                     target=run_account, args=(account, other), daemon=True,
