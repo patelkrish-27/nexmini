@@ -1,9 +1,15 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY railway /app/railway
-RUN chmod +x /app/railway/*.sh
 
-# Default is Account 1. Railway service start commands select the
-# appropriate script explicitly for each service.
-CMD ["/app/railway/account1-friday.sh"]
+COPY server/requirements.txt /app/server/requirements.txt
+RUN pip install --no-cache-dir -r /app/server/requirements.txt
+
+COPY server /app/server
+
+ENV NEXMINI_STATE_DIR=/data
+RUN mkdir -p /data
+
+EXPOSE 8000
+
+CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
