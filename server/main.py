@@ -119,6 +119,38 @@ def wait_for_kernel_idle(account: int, timeout_s: int = 1800, poll_s: int = 30) 
     return status
 
 
+def _patch_notebook_secrets(workdir: Path) -> None:
+    """Replace the Kaggle secrets lookup in the pushed notebook with the
+    values from env vars, because CLI-pushed runs cannot read user secrets."""
+    token = os.environ.get("NGROK_AUTHTOKEN", "").strip()
+    domain = os.environ.get(
+        "NGROK_DOMAIN",
+        NGROK_PUBLIC_URL.split("://", 1)[-1].rstrip("/"),
+    ).strip()
+    if not token or not domain:
+        LOG.warning("NGROK_AUTHTOKEN env not set on backend; notebook will fail at secrets cell")
+        return
+    notebooks = list(workdir.glob("*.ipynb"))
+    for nb_path in notebooks:
+        nb = json.loads(nb_path.read_text())
+        changed = False
+        for cell in nb.get("cells", []):
+            src = "".join(cell.get("source", []))
+            if "secrets.get_secret" in src and "NGROK_AUTHTOKEN" in src:
+                src = src.replace(
+                    'NGROK_AUTHTOKEN = secrets.get_secret("NGROK_AUTHTOKEN")',
+                    f'NGROK_AUTHTOKEN = {token!r}',
+                ).replace(
+                    'NGROK_DOMAIN = secrets.get_secret("NGROK_DOMAIN")',
+                    f'NGROK_DOMAIN = {domain!r}',
+                )
+                cell["source"] = src.splitlines(keepends=True)
+                changed = True
+        if changed:
+            nb_path.write_text(json.dumps(nb, indent=1))
+            LOG.info("patched ngrok secrets into %s", nb_path.name)
+
+
 def start_kernel(account: int) -> dict[str, Any]:
     """Pull the notebook from Kaggle and push it, starting a fresh run."""
     kernel = _kernel(account)
@@ -130,6 +162,8 @@ def start_kernel(account: int) -> dict[str, Any]:
     pull = _run(["kaggle", "kernels", "pull", kernel, "-p", str(workdir), "-m"], env)
     if pull.returncode != 0:
         raise RuntimeError(f"pull failed: {pull.stderr[-500:]}")
+
+    _patch_notebook_secrets(workdir)
 
     LOG.info("[A%s] pushing (timeout=%ss)", account, KERNEL_TIMEOUT)
     push = _run(
