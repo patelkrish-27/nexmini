@@ -1,16 +1,20 @@
 """NexMini scheduler backend.
 
-Runs the NexMini Kaggle notebook on two Kaggle accounts on a weekly schedule:
+Runs the NexMini Kaggle notebook on up to six Kaggle accounts covering
+24/7 in 12-hour blocks (see BLOCKS in the code):
 
-  - Account 1: Friday    20:00 IST  (covers Fri 20:00 -> Sat 08:00)
-  - Account 2: Saturday  08:00 IST  (covers Sat 08:00 -> Sat 20:00)
+  - Account 1: Friday  20:00 -> Saturday 08:00, Sun 08:00-20:00, Thu 20:00-Fri 08:00
+  - Account 2: Saturday 08:00 -> Saturday 20:00, Mon 08:00-20:00, Fri 08:00-20:00
+  - Account 3: Sat 20:00-Sun 08:00, Tue 08:00-20:00
+  - Account 4: Sun 20:00-Mon 08:00, Wed 08:00-20:00
+  - Account 5: Mon 20:00-Tue 08:00, Wed 20:00-Thu 08:00
+  - Account 6: Tue 20:00-Wed 08:00, Thu 08:00-20:00
 
 Both notebooks expose the same public ngrok URL, so the API endpoint stays
 constant across the account handoff.
 
 Environment variables (see .env.example):
-  KAGGLE_API_TOKEN_1, KAGGLE_KERNEL_1
-  KAGGLE_API_TOKEN_2, KAGGLE_KERNEL_2
+  KAGGLE_API_TOKEN_1..6, KAGGLE_KERNEL_1..6
   NGROK_PUBLIC_URL   (e.g. https://renewably-blog-food.ngrok-free.dev)
   KERNEL_TIMEOUT_SECONDS (default 43200 = 12h)
 """
@@ -165,44 +169,85 @@ def run_account(account: int, handoff_from: int | None = None) -> None:
 scheduler = BackgroundScheduler(timezone=IST)
 
 
-def _job_account1() -> None:
-    LOG.info("cron: starting account 1 (Friday night run)")
-    run_account(1)
+# Weekly block table: 12h blocks, Mon..Sun.
+# Account 1 (Fri 20:00 -> Sat 08:00) and Account 2 (Sat 08:00 -> Sat 20:00)
+# slots are preserved; the rest fills 24/7 coverage with up to 6 accounts.
+#
+# (start weekday 0=Mon, start hour, account)
+BLOCKS: list[tuple[int, int, int]] = [
+    (0,  8, 2),  # Mon 08-20
+    (0, 20, 5),  # Mon 20-Tue 08
+    (1,  8, 3),  # Tue 08-20
+    (1, 20, 6),  # Tue 20-Wed 08
+    (2,  8, 4),  # Wed 08-20
+    (2, 20, 5),  # Wed 20-Thu 08
+    (3,  8, 6),  # Thu 08-20
+    (3, 20, 1),  # Thu 20-Fri 08
+    (4,  8, 2),  # Fri 08-20
+    (4, 20, 1),  # Fri 20-Sat 08  (Account 1, unchanged)
+    (5,  8, 2),  # Sat 08-20       (Account 2, unchanged)
+    (5, 20, 3),  # Sat 20-Sun 08
+    (6,  8, 1),  # Sun 08-20
+    (6, 20, 4),  # Sun 20-Mon 08
+]
+
+_DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
-def _job_account2() -> None:
-    LOG.info("cron: starting account 2 (Saturday day run)")
-    run_account(2, handoff_from=1)
+def account_for(weekday: int, hour: int) -> int:
+    """Which account owns the 12h block containing (weekday 0=Mon, hour 0-23)."""
+    if hour < 8:      # night block started yesterday 20:00
+        weekday, hour = (weekday - 1) % 7, 20
+    elif hour >= 20:  # night block starts today 20:00
+        hour = 20
+    else:             # day block
+        hour = 8
+    starts = [b for b in BLOCKS if b[0] == weekday and b[1] == hour]
+    if not starts:
+        raise ValueError(f"no block for {weekday} {hour}")
+    return starts[0][2]
 
 
-def start_scheduler() -> None:
-    scheduler.add_job(
-        _job_account1, CronTrigger(day_of_week="fri", hour=20, minute=0, timezone=IST),
-        id="account1_friday", replace_existing=True,
-    )
-    scheduler.add_job(
-        _job_account2, CronTrigger(day_of_week="sat", hour=8, minute=0, timezone=IST),
-        id="account2_saturday", replace_existing=True,
-    )
-    scheduler.start()
-    LOG.info("scheduler started: A1 Fri 20:00 IST, A2 Sat 08:00 IST")
-
-
-# ------------------------------------------------------------------ app ----
-app = FastAPI(title="NexMini Scheduler", version="1.0.0")
+def previous_block_account(weekday: int, hour: int) -> int:
+    idx = BLOCKS.index(next(b for b in BLOCKS if b[0] == weekday and b[1] == hour))
+    return BLOCKS[(idx - 1) % len(BLOCKS)][2]
 
 
 def current_account(now: datetime | None = None) -> int | None:
-    """Which account should be live right now, per the weekly schedule."""
     now = now or datetime.now(IST)
-    wd, mins = now.weekday(), now.hour * 60 + now.minute  # Mon=0
-    if wd == 4 and mins >= 20 * 60:      # Friday >= 20:00
-        return 1
-    if wd == 5 and mins < 8 * 60:        # Saturday < 08:00 (tail of Friday)
-        return 1
-    if wd == 5 and mins < 20 * 60:       # Saturday 08:00-20:00
-        return 2
-    return None                          # Sat >= 20:00 or Sun-Thu
+    return account_for(now.weekday(), now.hour)
+
+
+def _make_job(weekday: int, hour: int, account: int):
+    def job() -> None:
+        LOG.info("cron: starting account %s (block %s %02d:00)", account, _DOW[weekday], hour)
+        run_account(account, handoff_from=previous_block_account(weekday, hour))
+
+    return job
+
+
+def start_scheduler() -> None:
+    for weekday, hour, account in BLOCKS:
+        token = os.environ.get(f"KAGGLE_API_TOKEN_{account}")
+        kernel = os.environ.get(f"KAGGLE_KERNEL_{account}")
+        if not token or not kernel:
+            LOG.warning(
+                "skipping %s %02d:00 block: account %s missing token/kernel env",
+                _DOW[weekday], hour, account,
+            )
+            continue
+        scheduler.add_job(
+            _make_job(weekday, hour, account),
+            CronTrigger(day_of_week=_DOW[weekday], hour=hour, minute=0, timezone=IST),
+            id=f"account{account}_{_DOW[weekday]}_{hour:02d}",
+            replace_existing=True,
+        )
+    scheduler.start()
+    LOG.info("scheduler started with %d block jobs", len(scheduler.get_jobs()))
+
+
+# ------------------------------------------------------------------ app ----
+app = FastAPI(title="NexMini Scheduler", version="1.1.0")
 
 
 @app.on_event("startup")
@@ -214,9 +259,15 @@ def _startup() -> None:
             status = kernel_status(account)
             LOG.info("startup: inside account %s window, kernel status=%s", account, status)
             if status not in ("RUNNING", "QUEUED"):
-                other = 2 if account == 1 else 1
+                now = datetime.now(IST)
+                bw = now.weekday()
+                bh = 8 if 8 <= now.hour < 20 else 20
+                if now.hour < 8:
+                    bw, bh = (bw - 1) % 7, 20
                 threading.Thread(
-                    target=run_account, args=(account, other), daemon=True,
+                    target=run_account,
+                    args=(account, previous_block_account(bw, bh)),
+                    daemon=True,
                 ).start()
             else:
                 LOG.info("startup: account %s kernel already running, nothing to do", account)
@@ -242,6 +293,12 @@ def schedule() -> dict[str, Any]:
 @app.get("/status")
 async def status() -> dict[str, Any]:
     state = _load_state()
+    kernels: dict[str, str] = {}
+    for i in range(1, 7):
+        if os.environ.get(f"KAGGLE_API_TOKEN_{i}") and os.environ.get(f"KAGGLE_KERNEL_{i}"):
+            kernels[f"account{i}"] = kernel_status(i)
+        else:
+            kernels[f"account{i}"] = "not configured"
     tunnel: dict[str, Any] = {"url": NGROK_PUBLIC_URL or None, "reachable": False}
     if NGROK_PUBLIC_URL:
         try:
@@ -258,18 +315,22 @@ async def status() -> dict[str, Any]:
         "time_ist": datetime.now(IST).isoformat(),
         "active_window": current_account(),
         "state": state,
-        "kernel_status_1": kernel_status(1) if os.environ.get("KAGGLE_API_TOKEN_1") else "no token",
-        "kernel_status_2": kernel_status(2) if os.environ.get("KAGGLE_API_TOKEN_2") else "no token",
+        "kernel_statuses": kernels,
         "tunnel": tunnel,
     }
 
 
 @app.post("/run/{account}")
 def run_now(account: int, background_tasks: BackgroundTasks, handoff: bool = True) -> dict[str, str]:
-    if account not in (1, 2):
-        raise HTTPException(400, "account must be 1 or 2")
-    other = 2 if account == 1 else 1
-    background_tasks.add_task(run_account, account, other if handoff else None)
+    if account not in range(1, 7):
+        raise HTTPException(400, "account must be 1-6")
+    now = datetime.now(IST)
+    bw = now.weekday()
+    bh = 8 if 8 <= now.hour < 20 else 20
+    if now.hour < 8:
+        bw, bh = (bw - 1) % 7, 20
+    prev = previous_block_account(bw, bh)
+    background_tasks.add_task(run_account, account, prev if handoff else None)
     return {"status": f"account {account} run scheduled", "note": "check /status for progress"}
 
 
@@ -280,6 +341,6 @@ class KernelTestResult(BaseModel):
 
 @app.get("/kernel/{account}/status", response_model=KernelTestResult)
 def kernel_status_endpoint(account: int) -> KernelTestResult:
-    if account not in (1, 2):
-        raise HTTPException(400, "account must be 1 or 2")
+    if account not in range(1, 7):
+        raise HTTPException(400, "account must be 1-6")
     return KernelTestResult(kernel=_kernel(account), status=kernel_status(account))

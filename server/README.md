@@ -1,15 +1,24 @@
 # NexMini Scheduler Backend
 
 One long-running FastAPI service that starts the NexMini Kaggle notebook
-for the right account at each weekly handoff:
+on up to six Kaggle accounts, covering 24/7 in 12-hour blocks at the same
+public ngrok URL:
 
-| Window (IST) | Account |
-|---|---|
-| Friday 20:00 → Saturday 08:00 | 1 |
-| Saturday 08:00 → Saturday 20:00 | 2 |
+| Starts (IST) | Account | Next (IST) | Account |
+|---|---|---|---|
+| Mon 08:00 | 2 | Mon 20:00 | 5 |
+| Tue 08:00 | 3 | Tue 20:00 | 6 |
+| Wed 08:00 | 4 | Wed 20:00 | 5 |
+| Thu 08:00 | 6 | Thu 20:00 | 1 |
+| Fri 08:00 | 2 | Fri 20:00 | 1 |
+| Sat 08:00 | 2 | Sat 20:00 | 3 |
+| Sun 08:00 | 1 | Sun 20:00 | 4 |
 
-Account 2's run waits until Account 1's kernel has finished before pushing,
+Account 1 (Fri 8pm → Sat 8am) and Account 2 (Sat 8am → 8pm) slots are
+unchanged. Every start waits for the previous block's kernel to finish,
 so the shared ngrok domain is never held by two agents at once.
+
+Hours per account per week: A1 36h, A2 36h, A3/A4/A5/A6 24h each.
 
 ## Setup
 
@@ -38,9 +47,9 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 - `GET /health` — ok + current IST time
 - `GET /schedule` — next cron runs
-- `GET /status` — last run state, live Kaggle kernel statuses, ngrok reachability
-- `GET /kernel/1/status`, `GET /kernel/2/status`
-- `POST /run/1`, `POST /run/2` — manual trigger (waits for other kernel if `handoff=true`)
+- `GET /status` — last run state, live Kaggle kernel statuses (all 6), ngrok reachability
+- `GET /kernel/{1..6}/status`
+- `POST /run/{1..6}` — manual trigger (waits for the previous block's kernel if `handoff=true`)
 
 ## Railway
 
