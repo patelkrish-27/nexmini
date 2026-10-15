@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -100,7 +101,7 @@ def kernel_status(account: int) -> str:
         p = _run(["kaggle", "kernels", "status", _kernel(account)], _kaggle_env(account), timeout=60)
         out = (p.stdout + p.stderr).strip()
         upper = out.upper()
-        for kw in ("RUNNING", "QUEUED", "COMPLETE", "FAILED", "ERROR", "CANCELLED", "STOPPED"):
+        for kw in ("RUNNING", "QUEUED", "COMPLETE", "FAILED", "ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED", "CANCEL", "STOPPED"):
             if kw in upper:
                 return kw
         return out[:120] or "UNKNOWN"
@@ -121,7 +122,11 @@ def wait_for_kernel_idle(account: int, timeout_s: int = 1800, poll_s: int = 30) 
 
 def _patch_notebook_secrets(workdir: Path) -> None:
     """Replace the Kaggle secrets lookup in the pushed notebook with the
-    values from env vars, because CLI-pushed runs cannot read user secrets."""
+    values from env vars, because CLI-pushed runs cannot read user secrets.
+
+    Handles both the original `secrets.get_secret(...)` form and the
+    already-hardcoded form from a previous push, so token/domain updates
+    propagate on every push."""
     token = os.environ.get("NGROK_AUTHTOKEN", "").strip()
     domain = os.environ.get(
         "NGROK_DOMAIN",
@@ -136,15 +141,36 @@ def _patch_notebook_secrets(workdir: Path) -> None:
         changed = False
         for cell in nb.get("cells", []):
             src = "".join(cell.get("source", []))
-            if "secrets.get_secret" in src and "NGROK_AUTHTOKEN" in src:
-                src = src.replace(
-                    'NGROK_AUTHTOKEN = secrets.get_secret("NGROK_AUTHTOKEN")',
-                    f'NGROK_AUTHTOKEN = {token!r}',
-                ).replace(
-                    'NGROK_DOMAIN = secrets.get_secret("NGROK_DOMAIN")',
-                    f'NGROK_DOMAIN = {domain!r}',
-                )
-                cell["source"] = src.splitlines(keepends=True)
+            if "NGROK_AUTHTOKEN" not in src and "NGROK_DOMAIN" not in src:
+                continue
+            new_src = src
+            # secrets.get_secret form
+            new_src = re.sub(
+                r'NGROK_AUTHTOKEN\s*=\s*secrets\.get_secret\(\s*["\']NGROK_AUTHTOKEN["\']\s*\)',
+                f'NGROK_AUTHTOKEN = {token!r}',
+                new_src,
+            )
+            new_src = re.sub(
+                r'NGROK_DOMAIN\s*=\s*secrets\.get_secret\(\s*["\']NGROK_DOMAIN["\']\s*\)',
+                f'NGROK_DOMAIN = {domain!r}',
+                new_src,
+            )
+            # already-hardcoded form from a previous push: NGROK_AUTHTOKEN = '...' / "..."
+            new_src = re.sub(
+                r"NGROK_AUTHTOKEN\s*=\s*['\"].*?['\"]",
+                f'NGROK_AUTHTOKEN = {token!r}',
+                new_src,
+                count=1,
+            )
+            new_src = re.sub(
+                r"NGROK_DOMAIN\s*=\s*['\"].*?['\"]",
+                f'NGROK_DOMAIN = {domain!r}',
+                new_src,
+                count=1,
+            )
+            # try/except fallback form: try: NGROK_DOMAIN = '...' except: None
+            if new_src != src:
+                cell["source"] = new_src.splitlines(keepends=True)
                 changed = True
         if token not in json.dumps(nb):
             LOG.warning("could not inject NGROK_AUTHTOKEN into notebook")
@@ -172,6 +198,26 @@ def _patch_notebook_secrets(workdir: Path) -> None:
             LOG.info("patched ngrok secrets + keepalive into %s", nb_path.name)
 
 
+def _patch_kernel_metadata(workdir: Path) -> None:
+    """Force GPU + internet on, so the 35B model notebook never gets pushed
+    with CPU-only settings (the notebook header requires GPU T4 x2)."""
+    for meta_path in workdir.glob("kernel-metadata.json"):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            continue
+        changed = False
+        if not meta.get("enable_gpu"):
+            meta["enable_gpu"] = True
+            changed = True
+        if not meta.get("enable_internet"):
+            meta["enable_internet"] = True
+            changed = True
+        if changed:
+            meta_path.write_text(json.dumps(meta, indent=2))
+            LOG.info("patched kernel-metadata.json: enable_gpu/internet=true")
+
+
 def start_kernel(account: int) -> dict[str, Any]:
     """Pull the notebook from Kaggle and push it, starting a fresh run."""
     kernel = _kernel(account)
@@ -185,6 +231,7 @@ def start_kernel(account: int) -> dict[str, Any]:
         raise RuntimeError(f"pull failed: {pull.stderr[-500:]}")
 
     _patch_notebook_secrets(workdir)
+    _patch_kernel_metadata(workdir)
 
     LOG.info("[A%s] pushing (timeout=%ss)", account, KERNEL_TIMEOUT)
     push = _run(
